@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-sms-forwarder",
+  "version": "1.0.0",
+  "description": "Send SMS codes to WhatsApp group automatically",
+  "main": "whatsapp_bot.js",
+  "scripts": {
+    "start": "node whatsapp_bot.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.5.0",
+    "@hapi/boom": "^10.0.1",
+    "express": "^4.18.2",
+    "pino": "^8.16.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
