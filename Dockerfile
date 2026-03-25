@@ -1,6 +1,13 @@
 FROM node:18-slim
 
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv build-essential && rm -rf /var/lib/apt/lists/*
+# Install Python + Build Tools + GIT (Yeh missing tha!)
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    build-essential \
+    git \          # ✅ Yeh add karo!
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . .
