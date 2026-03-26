@@ -134,6 +134,15 @@ def receive_sms():
 def status():
     return "<h1>🟢 SMS to WhatsApp Bridge Running</h1>"
 
+@app.route('/qr', methods=['GET'])
+def get_qr():
+    try:
+        # Port 5001 is where the Node.js bot serves its /qr
+        qr_resp = requests.get("http://127.0.0.1:5001/qr", timeout=5)
+        return qr_resp.content, qr_resp.status_code
+    except Exception as e:
+        return f"<h1>⚠️ Bot Unreachable</h1><p>{e}</p>", 500
+
 @app.route('/test', methods=['GET'])
 def test():
     send_telegram("🧪 Test - Bridge is working!")
