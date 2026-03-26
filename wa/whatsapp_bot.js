@@ -26,7 +26,7 @@ async function connectToWhatsApp() {
     sock = makeWASocket({
         version,
         auth: state,
-        logger: pino({ level: 'silent' }),
+        logger: pino({ level: 'warn' }), // 🔹 Changed from silent to warn to see errors
         browser: ['Railway SMS Bot', 'Chrome', '1.0.0']
     });
 
@@ -45,10 +45,12 @@ async function connectToWhatsApp() {
                 ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
                 : true;
 
-            console.log('❌ Connection closed. Reconnecting:', shouldReconnect);
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            console.log(`❌ Connection closed (Status: ${reason}). Reconnecting: ${shouldReconnect}`);
 
             if (shouldReconnect) {
-                connectToWhatsApp();
+                console.log('🔄 Reconnecting in 5 seconds...');
+                setTimeout(connectToWhatsApp, 5000); // 🔹 Added 5s delay to prevent looping
             }
         } else if (connection === 'open') {
             console.log('✅ WhatsApp connected successfully!');
