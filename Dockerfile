@@ -18,7 +18,7 @@ COPY . .
 # Install Node.js dependencies
 WORKDIR /app/wa
 RUN rm -rf node_modules package-lock.json
-RUN npm install @whiskeysockets/baileys@^6.5.0 @hapi/boom@^10.0.1 express@^4.18.2 pino@^8.16.0 qrcode-terminal@^0.12.0
+RUN npm install @whiskeysockets/baileys@^6.5.0 @hapi/boom@^10.0.1 express@^4.18.2 pino@^8.16.0 qrcode-terminal@^0.12.0 qrcode@^1.5.3
 
 # Install Python dependencies
 WORKDIR /app
