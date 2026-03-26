@@ -3,6 +3,7 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode'); // 🔹 For browser image
 const crypto = require('crypto');
 
 // 🔹 Fix for "crypto is not defined" error in some environments
@@ -21,6 +22,7 @@ const PORT = 5001; // Internal port for WhatsApp bot
 
 let sock;
 let groupJid = null;
+let currentQr = null; // 🔹 Store latest QR
 
 // ══════════════════════════════════════════
 //  INITIALIZE WHATSAPP CONNECTION
@@ -42,6 +44,7 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
+            currentQr = qr; // 🔹 Store it
             console.log('📱 Scan this QR code with WhatsApp:');
             qrcode.generate(qr, { small: true });
         }
@@ -140,6 +143,28 @@ app.post('/send_code', async (req, res) => {
         code: code,
         group: GROUP_NAME
     });
+});
+
+app.get('/qr', async (req, res) => {
+    if (!currentQr) {
+        return res.send('<h1>⏰ No QR code available yet.</h1><p>Wait for the bot to generate one in the logs.</p>');
+    }
+    
+    try {
+        const qrImage = await QRCode.toDataURL(currentQr);
+        res.send(`
+            <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0f2f5;font-family:sans-serif;">
+                <div style="background:white;padding:40px;border-radius:20px;box-shadow:0 10px 25px rgba(0,0,0,0.1);text-align:center;">
+                    <h1 style="color:#1d1d1f;margin-bottom:20px;">Link WhatsApp</h1>
+                    <img src="${qrImage}" style="width:300px;height:300px;border:10px solid #fff;outline:1px solid #eee;" />
+                    <p style="color:#86868b;margin-top:20px;font-size:14px;">Scan this with your phone<br><b>Linked Devices > Link a Device</b></p>
+                    <button onclick="window.location.reload()" style="margin-top:20px;padding:10px 20px;border:none;background:#25d366;color:white;border-radius:10px;cursor:pointer;font-weight:bold;">Refresh Code</button>
+                </div>
+            </body>
+        `);
+    } catch (err) {
+        res.status(500).send('Error generating QR code');
+    }
 });
 
 app.get('/test', (req, res) => {
