@@ -41,16 +41,19 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-                ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+            const error = lastDisconnect?.error;
+            const statusCode = error?.output?.statusCode || error?.status;
+            const message = error?.message || 'Unknown reason';
+
+            console.log(`❌ Connection closed. Status: ${statusCode}, Reason: ${message}`);
+            
+            const shouldReconnect = (error instanceof Boom)
+                ? statusCode !== DisconnectReason.loggedOut
                 : true;
 
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            console.log(`❌ Connection closed (Status: ${reason}). Reconnecting: ${shouldReconnect}`);
-
             if (shouldReconnect) {
-                console.log('🔄 Reconnecting in 5 seconds...');
-                setTimeout(connectToWhatsApp, 5000); // 🔹 Added 5s delay to prevent looping
+                console.log('🔄 Reconnecting in 10 seconds...');
+                setTimeout(connectToWhatsApp, 10000); 
             }
         } else if (connection === 'open') {
             console.log('✅ WhatsApp connected successfully!');
