@@ -11,7 +11,7 @@ app.use(express.json());
 //  CONFIGURATION
 // ══════════════════════════════════════════
 const GROUP_NAME = process.env.GROUP_NAME || "ram"; // 🔹 Change this!
-const PORT = process.env.PORT || 5001;
+const PORT = 5001; // Internal port for WhatsApp bot
 
 let sock;
 let groupJid = null;
