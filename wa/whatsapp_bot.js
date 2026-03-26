@@ -3,6 +3,12 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
+const crypto = require('crypto');
+
+// 🔹 Fix for "crypto is not defined" error in some environments
+if (!global.crypto) {
+    global.crypto = crypto;
+}
 
 const app = express();
 app.use(express.json());
