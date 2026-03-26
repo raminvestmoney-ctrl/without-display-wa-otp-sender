@@ -28,7 +28,7 @@ let currentQr = null; // 🔹 Store latest QR
 //  INITIALIZE WHATSAPP CONNECTION
 // ══════════════════════════════════════════
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { state, saveCreds } = await useMultiFileAuthState('/app/.wwebjs_cache');
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
