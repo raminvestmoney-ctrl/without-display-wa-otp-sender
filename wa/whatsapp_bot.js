@@ -23,12 +23,14 @@ const PORT = 5001; // Internal port for WhatsApp bot
 let sock;
 let groupJid = null;
 let currentQr = null; // 🔹 Store latest QR
+let saveCreds = null; // 🔹 Hoisted so shutdown handlers can flush credentials
 
 // ══════════════════════════════════════════
 //  INITIALIZE WHATSAPP CONNECTION
 // ══════════════════════════════════════════
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('/app/.wwebjs_cache');
+    const { state, saveCreds: _saveCreds } = await useMultiFileAuthState('/app/.wwebjs_cache');
+    saveCreds = _saveCreds; // 🔹 Expose to module scope for shutdown handlers
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
@@ -38,7 +40,7 @@ async function connectToWhatsApp() {
         browser: ['Railway SMS Bot', 'Chrome', '1.0.0']
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', () => saveCreds && saveCreds());
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -191,6 +193,57 @@ app.get('/groups', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+//  GRACEFUL SHUTDOWN
+// ══════════════════════════════════════════
+async function shutdown(signal) {
+    console.log(`\n⚠️  Received ${signal}. Saving session and shutting down...`);
+    try {
+        if (saveCreds) {
+            await saveCreds();
+            console.log('💾 Credentials saved successfully.');
+        }
+        if (sock) {
+            sock.end();
+            console.log('🔌 WhatsApp socket closed.');
+        }
+    } catch (err) {
+        console.error('❌ Error during shutdown:', err.message);
+    }
+    // Give the filesystem a moment to flush writes before the process exits
+    setTimeout(() => {
+        console.log('👋 Exiting cleanly.');
+        process.exit(0);
+    }, 2500);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// ══════════════════════════════════════════
+//  UNHANDLED ERROR HANDLERS
+// ══════════════════════════════════════════
+process.on('uncaughtException', async (err) => {
+    console.error('💥 Uncaught exception:', err);
+    try {
+        if (saveCreds) await saveCreds();
+        console.log('💾 Credentials saved after uncaught exception.');
+    } catch (saveErr) {
+        console.error('❌ Failed to save credentials:', saveErr.message);
+    }
+    setTimeout(() => process.exit(1), 2500);
+});
+
+process.on('unhandledRejection', async (reason) => {
+    console.error('💥 Unhandled promise rejection:', reason);
+    try {
+        if (saveCreds) await saveCreds();
+        console.log('💾 Credentials saved after unhandled rejection.');
+    } catch (saveErr) {
+        console.error('❌ Failed to save credentials:', saveErr.message);
+    }
+});
+
+// ══════════════════════════════════════════
 //  START SERVER
 // ══════════════════════════════════════════
 app.listen(PORT, () => {
@@ -198,4 +251,9 @@ app.listen(PORT, () => {
     console.log(`🚀 WhatsApp Bot running on port ${PORT}`);
     console.log('═'.repeat(50));
     connectToWhatsApp();
+
+    // 🔹 Periodic heartbeat so Railway logs confirm the process is alive
+    setInterval(() => {
+        console.log(`💓 Heartbeat — connected: ${!!sock}, group: ${groupJid || 'not found'}`);
+    }, 5 * 60 * 1000); // every 5 minutes
 });
