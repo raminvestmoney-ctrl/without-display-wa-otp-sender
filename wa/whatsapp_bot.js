@@ -29,6 +29,11 @@ if (!global.crypto) {
 const app = express();
 app.use(express.json());
 
+const fs = require('fs');
+if (fs.existsSync('auth_info_baileys')) {
+    fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+    console.log('🗑️ Cleared old session');
+}
 // ══════════════════════════════════════════
 //  CONFIGURATION
 // ══════════════════════════════════════════
