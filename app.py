@@ -58,6 +58,25 @@ def send_telegram(message, retries=3):
         time.sleep(2)
     return False
 
+def send_to_whatsapp_with_retry(payload, retries=3, delay=2):
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(f"📤 WhatsApp attempt {attempt}/{retries}...")
+            wa_resp = requests.post(WA_BOT_URL, json=payload, timeout=8)
+            logger.info(f"🚀 WhatsApp bot response: {wa_resp.status_code}")
+            return wa_resp
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"⚠️ WhatsApp bot not reachable (attempt {attempt}/{retries}): {e}")
+        except requests.exceptions.Timeout as e:
+            logger.warning(f"⚠️ WhatsApp bot timed out (attempt {attempt}/{retries}): {e}")
+        except Exception as e:
+            logger.error(f"❌ WhatsApp unexpected error (attempt {attempt}/{retries}): {e}")
+        if attempt < retries:
+            time.sleep(delay)
+    logger.error(f"❌ WhatsApp bot unreachable after {retries} attempts")
+    return None
+
+
 @app.route('/sms', methods=['POST', 'GET'])
 def receive_sms():
     try:
@@ -97,19 +116,12 @@ def receive_sms():
             code = code_match.group(1)
             logger.info(f"🎯 CODE DETECTED: {code}")
             
-            # Send to WhatsApp bot (Node.js)
-            try:
-                wa_resp = requests.post(
-                    WA_BOT_URL, 
-                    json={"code": code, "message": content}, 
-                    timeout=8
-                )
-                logger.info(f"🚀 WhatsApp bot response: {wa_resp.status_code}")
-            except Exception as wa_err:
-                logger.error(f"❌ WhatsApp bot unreachable: {wa_err}")
+            # Send to WhatsApp bot (Node.js) with retry
+            send_to_whatsapp_with_retry({"code": code, "message": content})
         else:
             logger.warning(f"🤔 No 6-digit code found")
         
+
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # Send to Telegram
@@ -146,13 +158,7 @@ def get_qr():
 @app.route('/test', methods=['GET'])
 def test():
     send_telegram("🧪 Test - Bridge is working!")
-    
-    try:
-        wa_test = requests.post(WA_BOT_URL, json={"code": "123456", "message": "Test"}, timeout=5)
-        logger.info(f"WhatsApp test: {wa_test.status_code}")
-    except Exception as e:
-        logger.warning(f"⚠️ WhatsApp test failed: {e}")
-        
+    send_to_whatsapp_with_retry({"code": "123456", "message": "Test"})
     return "OK - Check Telegram & WhatsApp", 200
 
 if __name__ == '__main__':
