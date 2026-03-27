@@ -3,10 +3,9 @@ const { Boom } = require('@hapi/boom');
 const express = require('express');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode'); // 🔹 For browser image
+const QRCode = require('qrcode');
 const crypto = require('crypto');
 
-// 🔹 Fix for "crypto is not defined" error in some environments
 if (!global.crypto) {
     global.crypto = crypto;
 }
@@ -17,58 +16,93 @@ app.use(express.json());
 // ══════════════════════════════════════════
 //  CONFIGURATION
 // ══════════════════════════════════════════
-const GROUP_NAME = process.env.GROUP_NAME || "ram"; // 🔹 Change this!
-const PORT = 5001; // Internal port for WhatsApp bot
+const GROUP_NAME = process.env.GROUP_NAME || "ram";
+const PORT = 5001;
 
 let sock;
 let groupJid = null;
-let currentQr = null; // 🔹 Store latest QR
-let saveCreds = null; // 🔹 Hoisted so shutdown handlers can flush credentials
+let currentQr = null;
+let isReady = false; // 🔑 KEY FIX: Track if socket is truly ready to send
+
+// ══════════════════════════════════════════
+//  WAIT UNTIL READY HELPER
+// ══════════════════════════════════════════
+function waitUntilReady(timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+        if (isReady) return resolve();
+        const start = Date.now();
+        const interval = setInterval(() => {
+            if (isReady) {
+                clearInterval(interval);
+                resolve();
+            } else if (Date.now() - start > timeoutMs) {
+                clearInterval(interval);
+                reject(new Error('Timed out waiting for WhatsApp to be ready'));
+            }
+        }, 300);
+    });
+}
 
 // ══════════════════════════════════════════
 //  INITIALIZE WHATSAPP CONNECTION
 // ══════════════════════════════════════════
 async function connectToWhatsApp() {
-    const { state, saveCreds: _saveCreds } = await useMultiFileAuthState('/app/.wwebjs_cache');
-    saveCreds = _saveCreds; // 🔹 Expose to module scope for shutdown handlers
+    isReady = false; // Reset on each reconnect
+
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
         version,
         auth: state,
-        logger: pino({ level: 'warn' }), // 🔹 Changed from silent to warn to see errors
-        browser: ['Railway SMS Bot', 'Chrome', '1.0.0']
+        logger: pino({ level: 'warn' }),
+        browser: ['Railway SMS Bot', 'Chrome', '1.0.0'],
+        // 🔑 KEY FIX: Give Baileys more time to sync keys after connect
+        connectTimeoutMs: 30000,
+        defaultQueryTimeoutMs: 30000,
     });
 
-    sock.ev.on('creds.update', () => saveCreds && saveCreds());
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            currentQr = qr; // 🔹 Store it
+            currentQr = qr;
+            isReady = false; // Not ready while showing QR
             console.log('📱 Scan this QR code with WhatsApp:');
             qrcode.generate(qr, { small: true });
         }
 
         if (connection === 'close') {
+            isReady = false;
             const error = lastDisconnect?.error;
             const statusCode = error?.output?.statusCode || error?.status;
             const message = error?.message || 'Unknown reason';
 
             console.log(`❌ Connection closed. Status: ${statusCode}, Reason: ${message}`);
-            
+
             const shouldReconnect = (error instanceof Boom)
                 ? statusCode !== DisconnectReason.loggedOut
                 : true;
 
             if (shouldReconnect) {
                 console.log('🔄 Reconnecting in 10 seconds...');
-                setTimeout(connectToWhatsApp, 10000); 
+                setTimeout(connectToWhatsApp, 10000);
             }
         } else if (connection === 'open') {
             console.log('✅ WhatsApp connected successfully!');
+
+            // 🔑 KEY FIX: Wait 4 seconds for Baileys to finish syncing
+            // signal store / session keys before we try to use it.
+            // "No sessions" happens when we call sendMessage too fast after open.
+            console.log('⏳ Waiting for session keys to sync...');
+            await new Promise(r => setTimeout(r, 4000));
+
             await findGroupJid();
+
+            isReady = true; // ✅ Now truly ready
+            console.log('🟢 Bot is fully ready to send messages!');
         }
     });
 
@@ -76,7 +110,7 @@ async function connectToWhatsApp() {
 }
 
 // ══════════════════════════════════════════
-//  FIND GROUP JID (Internal WhatsApp ID)
+//  FIND GROUP JID
 // ══════════════════════════════════════════
 async function findGroupJid() {
     try {
@@ -108,21 +142,47 @@ async function findGroupJid() {
 // ══════════════════════════════════════════
 async function sendToGroup(message) {
     if (!sock) {
-        console.log('❌ WhatsApp not connected!');
+        console.log('❌ WhatsApp not connected! (sock is null)');
+        return false;
+    }
+
+    // 🔑 KEY FIX: Wait for socket to be fully ready before sending
+    try {
+        await waitUntilReady(15000);
+    } catch (e) {
+        console.log('❌ Socket not ready in time:', e.message);
         return false;
     }
 
     if (!groupJid) {
-        console.log('❌ Group JID not found! Check GROUP_NAME.');
-        return false;
+        console.log('⚠️ Group JID not found, retrying...');
+        await findGroupJid();
+        if (!groupJid) return false;
     }
 
     try {
         await sock.sendMessage(groupJid, { text: message });
-        console.log(`✅ Message sent: ${message}`);
+        console.log(`✅ Message sent to group: ${message}`);
         return true;
     } catch (error) {
-        console.error('❌ Send failed:', error.message);
+        console.error('❌ WhatsApp Send Error:', error.message);
+
+        // 🔑 KEY FIX: On "No sessions", wait longer and retry once
+        if (error.message.includes('No sessions')) {
+            console.log('🔄 "No sessions" detected — waiting 5s for key sync and retrying...');
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+                await sock.sendMessage(groupJid, { text: message });
+                console.log('✅ Retry succeeded!');
+                return true;
+            } catch (retryErr) {
+                console.error('❌ Retry failed:', retryErr.message);
+                // If still failing, force a full reconnect
+                console.log('🔄 Forcing reconnect to fix session...');
+                isReady = false;
+                setTimeout(connectToWhatsApp, 1000);
+            }
+        }
         return false;
     }
 }
@@ -137,13 +197,15 @@ app.post('/send_code', async (req, res) => {
         return res.status(400).json({ status: 'no_code' });
     }
 
-    console.log(`📩 Received code: ${code}`);
+    console.log(`📩 Request received to send code: ${code}`);
     const result = await sendToGroup(code);
 
     res.json({
         status: result ? 'sent' : 'failed',
         code: code,
-        group: GROUP_NAME
+        group: GROUP_NAME,
+        connected: !!sock && groupJid != null,
+        ready: isReady
     });
 });
 
@@ -151,7 +213,7 @@ app.get('/qr', async (req, res) => {
     if (!currentQr) {
         return res.send('<h1>⏰ No QR code available yet.</h1><p>Wait for the bot to generate one in the logs.</p>');
     }
-    
+
     try {
         const qrImage = await QRCode.toDataURL(currentQr);
         res.send(`
@@ -174,7 +236,8 @@ app.get('/test', (req, res) => {
         status: 'running',
         whatsapp_connected: !!sock,
         group_found: !!groupJid,
-        group_name: GROUP_NAME
+        group_name: GROUP_NAME,
+        ready: isReady  // 🔑 Now visible in /test response
     });
 });
 
@@ -193,57 +256,6 @@ app.get('/groups', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-//  GRACEFUL SHUTDOWN
-// ══════════════════════════════════════════
-async function shutdown(signal) {
-    console.log(`\n⚠️  Received ${signal}. Saving session and shutting down...`);
-    try {
-        if (saveCreds) {
-            await saveCreds();
-            console.log('💾 Credentials saved successfully.');
-        }
-        if (sock) {
-            sock.end();
-            console.log('🔌 WhatsApp socket closed.');
-        }
-    } catch (err) {
-        console.error('❌ Error during shutdown:', err.message);
-    }
-    // Give the filesystem a moment to flush writes before the process exits
-    setTimeout(() => {
-        console.log('👋 Exiting cleanly.');
-        process.exit(0);
-    }, 2500);
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
-
-// ══════════════════════════════════════════
-//  UNHANDLED ERROR HANDLERS
-// ══════════════════════════════════════════
-process.on('uncaughtException', async (err) => {
-    console.error('💥 Uncaught exception:', err);
-    try {
-        if (saveCreds) await saveCreds();
-        console.log('💾 Credentials saved after uncaught exception.');
-    } catch (saveErr) {
-        console.error('❌ Failed to save credentials:', saveErr.message);
-    }
-    setTimeout(() => process.exit(1), 2500);
-});
-
-process.on('unhandledRejection', async (reason) => {
-    console.error('💥 Unhandled promise rejection:', reason);
-    try {
-        if (saveCreds) await saveCreds();
-        console.log('💾 Credentials saved after unhandled rejection.');
-    } catch (saveErr) {
-        console.error('❌ Failed to save credentials:', saveErr.message);
-    }
-});
-
-// ══════════════════════════════════════════
 //  START SERVER
 // ══════════════════════════════════════════
 app.listen(PORT, () => {
@@ -251,9 +263,4 @@ app.listen(PORT, () => {
     console.log(`🚀 WhatsApp Bot running on port ${PORT}`);
     console.log('═'.repeat(50));
     connectToWhatsApp();
-
-    // 🔹 Periodic heartbeat so Railway logs confirm the process is alive
-    setInterval(() => {
-        console.log(`💓 Heartbeat — connected: ${!!sock}, group: ${groupJid || 'not found'}`);
-    }, 5 * 60 * 1000); // every 5 minutes
 });
