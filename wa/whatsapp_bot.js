@@ -1,10 +1,26 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore,
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const express = require('express');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
+
+// ══════════════════════════════════════════
+//  CRASH PROTECTION — must be first
+// ══════════════════════════════════════════
+process.on('unhandledRejection', (err) => {
+    console.error('⚠️ Unhandled rejection (caught):', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Uncaught exception (caught):', err?.message || err);
+});
 
 if (!global.crypto) {
     global.crypto = crypto;
@@ -18,16 +34,23 @@ app.use(express.json());
 // ══════════════════════════════════════════
 const GROUP_NAME = process.env.GROUP_NAME || "ram";
 const PORT = 5001;
+const AUTH_FOLDER = 'auth_info_baileys';
 
-let sock;
+// ══════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════
+let sock = null;
 let groupJid = null;
 let currentQr = null;
-let isReady = false; // 🔑 KEY FIX: Track if socket is truly ready to send
+let isReady = false;
+let isConnecting = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
 
 // ══════════════════════════════════════════
-//  WAIT UNTIL READY HELPER
+//  WAIT UNTIL READY
 // ══════════════════════════════════════════
-function waitUntilReady(timeoutMs = 15000) {
+function waitUntilReady(timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
         if (isReady) return resolve();
         const start = Date.now();
@@ -44,69 +67,121 @@ function waitUntilReady(timeoutMs = 15000) {
 }
 
 // ══════════════════════════════════════════
-//  INITIALIZE WHATSAPP CONNECTION
+//  SCHEDULE RECONNECT (with backoff)
+// ══════════════════════════════════════════
+function scheduleReconnect(delayMs) {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectToWhatsApp();
+    }, delayMs);
+}
+
+// ══════════════════════════════════════════
+//  CONNECT TO WHATSAPP
 // ══════════════════════════════════════════
 async function connectToWhatsApp() {
-    isReady = false; // Reset on each reconnect
+    if (isConnecting) {
+        console.log('⏳ Already connecting, skipping...');
+        return;
+    }
 
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    const { version } = await fetchLatestBaileysVersion();
+    isConnecting = true;
+    isReady = false;
+    groupJid = null;
 
-    sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'warn' }),
-        browser: ['Railway SMS Bot', 'Chrome', '1.0.0'],
-        // 🔑 KEY FIX: Give Baileys more time to sync keys after connect
-        connectTimeoutMs: 30000,
-        defaultQueryTimeoutMs: 30000,
-    });
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+        const { version } = await fetchLatestBaileysVersion();
 
-    sock.ev.on('creds.update', saveCreds);
+        console.log(`🔌 Connecting with Baileys v${version.join('.')}`);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        sock = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                // ✅ makeCacheableSignalKeyStore fixes "No sessions" error
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+            },
+            logger: pino({ level: 'silent' }),
+            browser: ['SMS-Bot', 'Chrome', '1.0.0'],
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000,
+            retryRequestDelayMs: 2000,
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
+        });
 
-        if (qr) {
-            currentQr = qr;
-            isReady = false; // Not ready while showing QR
-            console.log('📱 Scan this QR code with WhatsApp:');
-            qrcode.generate(qr, { small: true });
-        }
+        sock.ev.on('creds.update', saveCreds);
 
-        if (connection === 'close') {
-            isReady = false;
-            const error = lastDisconnect?.error;
-            const statusCode = error?.output?.statusCode || error?.status;
-            const message = error?.message || 'Unknown reason';
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-            console.log(`❌ Connection closed. Status: ${statusCode}, Reason: ${message}`);
-
-            const shouldReconnect = (error instanceof Boom)
-                ? statusCode !== DisconnectReason.loggedOut
-                : true;
-
-            if (shouldReconnect) {
-                console.log('🔄 Reconnecting in 10 seconds...');
-                setTimeout(connectToWhatsApp, 10000);
+            if (qr) {
+                currentQr = qr;
+                isReady = false;
+                console.log('📱 New QR — scan at /qr');
+                qrcode.generate(qr, { small: true });
             }
-        } else if (connection === 'open') {
-            console.log('✅ WhatsApp connected successfully!');
 
-            // 🔑 KEY FIX: Wait 4 seconds for Baileys to finish syncing
-            // signal store / session keys before we try to use it.
-            // "No sessions" happens when we call sendMessage too fast after open.
-            console.log('⏳ Waiting for session keys to sync...');
-            await new Promise(r => setTimeout(r, 4000));
+            if (connection === 'close') {
+                isReady = false;
+                isConnecting = false;
 
-            await findGroupJid();
+                const error = lastDisconnect?.error;
+                const statusCode = error?.output?.statusCode || error?.status;
+                const reason = error?.message || 'Unknown';
 
-            isReady = true; // ✅ Now truly ready
-            console.log('🟢 Bot is fully ready to send messages!');
-        }
-    });
+                console.log(`❌ Disconnected. Code: ${statusCode} | Reason: ${reason}`);
 
-    sock.ev.on('messages.upsert', () => {});
+                // 401 = logged out, needs fresh QR
+                if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                    console.log('🚫 Logged out! Delete auth_info_baileys and re-scan QR.');
+                    currentQr = null;
+                    return;
+                }
+
+                // 440 = conflict (another WA session open on PC/phone)
+                if (statusCode === 440) {
+                    reconnectAttempts++;
+                    const delay = Math.min(15000 * reconnectAttempts, 60000);
+                    console.log(`⚠️ Conflict! Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts})`);
+                    console.log('💡 Close WhatsApp Web on PC to stop conflicts!');
+                    scheduleReconnect(delay);
+                    return;
+                }
+
+                // All other disconnects
+                reconnectAttempts++;
+                const delay = Math.min(5000 * reconnectAttempts, 30000);
+                console.log(`🔄 Reconnecting in ${delay / 1000}s...`);
+                scheduleReconnect(delay);
+
+            } else if (connection === 'open') {
+                reconnectAttempts = 0;
+                currentQr = null; // Clear QR — no longer needed
+                console.log('✅ WhatsApp connected!');
+
+                // ✅ Wait for Baileys internal key sync — prevents "No sessions"
+                console.log('⏳ Syncing session keys (5s)...');
+                await new Promise(r => setTimeout(r, 5000));
+
+                await findGroupJid();
+
+                isReady = true;
+                isConnecting = false;
+                console.log('🟢 Bot is fully ready to send messages!');
+            }
+        });
+
+        sock.ev.on('messages.upsert', () => {});
+
+    } catch (err) {
+        console.error('❌ connectToWhatsApp error:', err.message);
+        isConnecting = false;
+        scheduleReconnect(10000);
+    }
 }
 
 // ══════════════════════════════════════════
@@ -118,73 +193,68 @@ async function findGroupJid() {
         const groupList = Object.values(groups);
 
         console.log('\n📋 Available Groups:');
-        groupList.forEach((group, index) => {
-            console.log(`${index + 1}. ${group.subject}`);
-        });
+        groupList.forEach((g, i) => console.log(`  ${i + 1}. ${g.subject}`));
 
-        const targetGroup = groupList.find(g => g.subject === GROUP_NAME);
-
-        if (targetGroup) {
-            groupJid = targetGroup.id;
-            console.log(`\n✅ Target group found: ${GROUP_NAME}`);
-            console.log(`🆔 Group JID: ${groupJid}\n`);
+        const target = groupList.find(g => g.subject === GROUP_NAME);
+        if (target) {
+            groupJid = target.id;
+            console.log(`✅ Group found: "${GROUP_NAME}" → ${groupJid}\n`);
         } else {
-            console.log(`\n⚠️ Group "${GROUP_NAME}" not found!`);
-            console.log('💡 Available groups listed above. Update GROUP_NAME in code.\n');
+            console.log(`⚠️ Group "${GROUP_NAME}" NOT found. Check GROUP_NAME env var.\n`);
         }
-    } catch (error) {
-        console.error('❌ Error fetching groups:', error.message);
+    } catch (err) {
+        console.error('❌ Error fetching groups:', err.message);
     }
 }
 
 // ══════════════════════════════════════════
-//  SEND MESSAGE TO GROUP
+//  SEND MESSAGE (3 attempts with backoff)
 // ══════════════════════════════════════════
 async function sendToGroup(message) {
     if (!sock) {
-        console.log('❌ WhatsApp not connected! (sock is null)');
+        console.log('❌ sock is null');
         return false;
     }
 
-    // 🔑 KEY FIX: Wait for socket to be fully ready before sending
     try {
-        await waitUntilReady(15000);
+        await waitUntilReady(20000);
     } catch (e) {
-        console.log('❌ Socket not ready in time:', e.message);
+        console.log('❌ Not ready in time:', e.message);
         return false;
     }
 
     if (!groupJid) {
-        console.log('⚠️ Group JID not found, retrying...');
+        console.log('⚠️ No groupJid, retrying fetch...');
         await findGroupJid();
         if (!groupJid) return false;
     }
 
-    try {
-        await sock.sendMessage(groupJid, { text: message });
-        console.log(`✅ Message sent to group: ${message}`);
-        return true;
-    } catch (error) {
-        console.error('❌ WhatsApp Send Error:', error.message);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            await sock.sendMessage(groupJid, { text: message });
+            console.log(`✅ Sent (attempt ${attempt}): ${message}`);
+            return true;
+        } catch (err) {
+            console.error(`❌ Send attempt ${attempt} failed: ${err.message}`);
 
-        // 🔑 KEY FIX: On "No sessions", wait longer and retry once
-        if (error.message.includes('No sessions')) {
-            console.log('🔄 "No sessions" detected — waiting 5s for key sync and retrying...');
-            await new Promise(r => setTimeout(r, 5000));
-            try {
-                await sock.sendMessage(groupJid, { text: message });
-                console.log('✅ Retry succeeded!');
-                return true;
-            } catch (retryErr) {
-                console.error('❌ Retry failed:', retryErr.message);
-                // If still failing, force a full reconnect
-                console.log('🔄 Forcing reconnect to fix session...');
-                isReady = false;
-                setTimeout(connectToWhatsApp, 1000);
+            if (attempt < 3) {
+                const wait = attempt * 3000;
+                console.log(`🔄 Retrying in ${wait / 1000}s...`);
+                await new Promise(r => setTimeout(r, wait));
+
+                if (err.message?.includes('No sessions') || err.message?.includes('Timed Out')) {
+                    console.log('🔑 Key sync issue — waiting extra 5s...');
+                    await new Promise(r => setTimeout(r, 5000));
+                }
             }
         }
-        return false;
     }
+
+    console.log('🔄 All send attempts failed. Triggering reconnect...');
+    isReady = false;
+    isConnecting = false;
+    scheduleReconnect(3000);
+    return false;
 }
 
 // ══════════════════════════════════════════
@@ -192,26 +262,32 @@ async function sendToGroup(message) {
 // ══════════════════════════════════════════
 app.post('/send_code', async (req, res) => {
     const { code, message } = req.body;
+    if (!code) return res.status(400).json({ status: 'no_code' });
 
-    if (!code) {
-        return res.status(400).json({ status: 'no_code' });
-    }
-
-    console.log(`📩 Request received to send code: ${code}`);
-    const result = await sendToGroup(code);
+    console.log(`📩 Send request — code: ${code}`);
+    const result = await sendToGroup(message || code);
 
     res.json({
         status: result ? 'sent' : 'failed',
-        code: code,
+        code,
         group: GROUP_NAME,
-        connected: !!sock && groupJid != null,
-        ready: isReady
+        connected: !!sock,
+        ready: isReady,
     });
 });
 
 app.get('/qr', async (req, res) => {
     if (!currentQr) {
-        return res.send('<h1>⏰ No QR code available yet.</h1><p>Wait for the bot to generate one in the logs.</p>');
+        return res.send(`
+            <body style="display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0f2f5;font-family:sans-serif;">
+                <div style="background:white;padding:40px;border-radius:20px;text-align:center;box-shadow:0 10px 25px rgba(0,0,0,0.1);">
+                    <h2>✅ Already Connected</h2>
+                    <p>Bot is running — no QR needed.</p>
+                    <p style="color:#888;font-size:13px;">To re-link: delete <b>auth_info_baileys</b> folder and redeploy.</p>
+                    <button onclick="window.location.reload()" style="margin-top:16px;padding:10px 20px;background:#25d366;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:bold;">Refresh</button>
+                </div>
+            </body>
+        `);
     }
 
     try {
@@ -219,15 +295,16 @@ app.get('/qr', async (req, res) => {
         res.send(`
             <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0f2f5;font-family:sans-serif;">
                 <div style="background:white;padding:40px;border-radius:20px;box-shadow:0 10px 25px rgba(0,0,0,0.1);text-align:center;">
-                    <h1 style="color:#1d1d1f;margin-bottom:20px;">Link WhatsApp</h1>
-                    <img src="${qrImage}" style="width:300px;height:300px;border:10px solid #fff;outline:1px solid #eee;" />
-                    <p style="color:#86868b;margin-top:20px;font-size:14px;">Scan this with your phone<br><b>Linked Devices > Link a Device</b></p>
-                    <button onclick="window.location.reload()" style="margin-top:20px;padding:10px 20px;border:none;background:#25d366;color:white;border-radius:10px;cursor:pointer;font-weight:bold;">Refresh Code</button>
+                    <h1 style="color:#1d1d1f;margin-bottom:8px;">📱 Link WhatsApp</h1>
+                    <p style="color:#888;margin-bottom:20px;">Open WhatsApp → Linked Devices → Link a Device</p>
+                    <img src="${qrImage}" style="width:280px;height:280px;border:8px solid #f0f2f5;border-radius:12px;" />
+                    <p style="color:#86868b;margin-top:16px;font-size:13px;">QR expires every ~20 seconds</p>
+                    <button onclick="window.location.reload()" style="margin-top:12px;padding:10px 24px;border:none;background:#25d366;color:white;border-radius:10px;cursor:pointer;font-weight:bold;font-size:15px;">🔄 Refresh QR</button>
                 </div>
             </body>
         `);
     } catch (err) {
-        res.status(500).send('Error generating QR code');
+        res.status(500).send('Error generating QR');
     }
 });
 
@@ -237,30 +314,34 @@ app.get('/test', (req, res) => {
         whatsapp_connected: !!sock,
         group_found: !!groupJid,
         group_name: GROUP_NAME,
-        ready: isReady  // 🔑 Now visible in /test response
+        ready: isReady,
+        reconnect_attempts: reconnectAttempts,
     });
 });
 
 app.get('/groups', async (req, res) => {
+    if (!sock) return res.status(503).json({ error: 'Not connected' });
     try {
         const groups = await sock.groupFetchAllParticipating();
-        const groupList = Object.values(groups).map(g => ({
+        const list = Object.values(groups).map(g => ({
             name: g.subject,
             id: g.id,
-            participants: g.participants.length
+            participants: g.participants.length,
         }));
-        res.json({ groups: groupList });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.json({ groups: list, total: list.length });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ══════════════════════════════════════════
-//  START SERVER
+//  START
 // ══════════════════════════════════════════
 app.listen(PORT, () => {
     console.log('═'.repeat(50));
-    console.log(`🚀 WhatsApp Bot running on port ${PORT}`);
+    console.log(`🚀 WhatsApp Bot on port ${PORT}`);
+    console.log(`📁 Session folder: ${AUTH_FOLDER}/`);
+    console.log(`👥 Target group: ${GROUP_NAME}`);
     console.log('═'.repeat(50));
     connectToWhatsApp();
 });
