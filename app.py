@@ -7,36 +7,60 @@ import os
 import re
 from datetime import datetime
 
-# WhatsApp bot URL (both services run in same container)
+# ══════════════════════════════════════════
+#  LOGGING — must be set up FIRST
+# ══════════════════════════════════════════
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════
 WA_BOT_URL = os.environ.get("WA_BOT_URL", "http://127.0.0.1:5001/send_code")
 SMS_FILTER_SENDER = "3737"
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+if TELEGRAM_TOKEN.startswith("bot"):
+    logger.info("🤖 Removing 'bot' prefix from provided Telegram token...")
+    TELEGRAM_TOKEN = TELEGRAM_TOKEN[3:]
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+CHAT_ID = os.environ.get("CHAT_ID", "").strip()
+
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN is MISSING in environment variables!")
+if not CHAT_ID:
+    logger.error("❌ CHAT_ID is MISSING in environment variables!")
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 recent_messages = {}
 
+# ══════════════════════════════════════════
+#  DUPLICATE DETECTION
+# ══════════════════════════════════════════
 def is_duplicate(sender, content):
     msg_hash = hashlib.md5(f"{sender}{content}".encode()).hexdigest()
     current_time = time.time()
-    
+
     if msg_hash in recent_messages:
         if current_time - recent_messages[msg_hash] < 60:
             return True
-            
+
     recent_messages[msg_hash] = current_time
     expired = [k for k, v in recent_messages.items() if current_time - v > 300]
     for k in expired:
         del recent_messages[k]
     return False
 
-def send_telegram(message, retries=3):
+# ══════════════════════════════════════════
+#  TELEGRAM
+# ══════════════════════════════════════════
+def send_telegram(message, retries=2):
+    masked_token = (TELEGRAM_TOKEN[:4] + "..." + TELEGRAM_TOKEN[-4:]) if len(TELEGRAM_TOKEN) > 10 else "MISSING"
+    logger.info(f"📤 Sending to Telegram Chat: {CHAT_ID} (Token: {masked_token})")
+
     for attempt in range(retries):
         try:
             response = requests.post(TELEGRAM_API, data={
@@ -44,49 +68,36 @@ def send_telegram(message, retries=3):
                 'text': message,
                 'parse_mode': 'HTML',
                 'disable_web_page_preview': True
-            }, timeout=10)
-            
+            }, timeout=8)
+
             if response.status_code == 200:
                 logger.info("✅ Telegram sent!")
                 return True
             else:
-                logger.warning(f"⚠️ Telegram error: {response.text}")
-                
+                logger.warning(f"⚠️ Telegram failure (HTTP {response.status_code}): {response.text}")
+                if response.status_code == 404:
+                    logger.error("🛑 Telegram Bot NOT FOUND. Check TELEGRAM_TOKEN!")
+                    break
         except Exception as e:
-            logger.error(f"❌ Error: {e}")
-        
-        time.sleep(2)
+            logger.error(f"❌ Telegram exception: {e}")
+
+        if attempt < retries - 1:
+            time.sleep(1)
     return False
 
-def send_to_whatsapp_with_retry(payload, retries=3, delay=2):
-    for attempt in range(1, retries + 1):
-        try:
-            logger.info(f"📤 WhatsApp attempt {attempt}/{retries}...")
-            wa_resp = requests.post(WA_BOT_URL, json=payload, timeout=8)
-            logger.info(f"🚀 WhatsApp bot response: {wa_resp.status_code}")
-            return wa_resp
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"⚠️ WhatsApp bot not reachable (attempt {attempt}/{retries}): {e}")
-        except requests.exceptions.Timeout as e:
-            logger.warning(f"⚠️ WhatsApp bot timed out (attempt {attempt}/{retries}): {e}")
-        except Exception as e:
-            logger.error(f"❌ WhatsApp unexpected error (attempt {attempt}/{retries}): {e}")
-        if attempt < retries:
-            time.sleep(delay)
-    logger.error(f"❌ WhatsApp bot unreachable after {retries} attempts")
-    return None
-
-
+# ══════════════════════════════════════════
+#  SMS RECEIVER
+# ══════════════════════════════════════════
 @app.route('/sms', methods=['POST', 'GET'])
 def receive_sms():
     try:
         sender = request.args.get('sender') or 'Unknown'
         receiver = request.args.get('receiver') or 'Unknown'
         port = request.args.get('port') or 'N/A'
-        
+
         raw_data = request.get_data(as_text=True)
         content = "Empty Message"
-        
+
         if '\n\n' in raw_data:
             parts = raw_data.split('\n\n')
             if len(parts) > 1:
@@ -97,34 +108,41 @@ def receive_sms():
                 content = lines[-1].strip()
 
         if "Sender:" in content or "SMSC:" in content:
-             content = raw_data
-        
+            content = raw_data
+
         logger.info(f"📩 SMS from {sender}: {content[:50]}...")
-        
+
         if sender != SMS_FILTER_SENDER:
             logger.info(f"⏭️ Ignored SMS from {sender}")
             return jsonify({"status": "ignored"}), 200
 
         if is_duplicate(sender, content):
-            logger.info(f"⏳ Duplicate message - Skipping.")
+            logger.info("⏳ Duplicate message - Skipping.")
             return jsonify({"status": "duplicate"}), 200
 
         # Extract 6-digit code
         code_match = re.search(r'\b(\d{6})\b', content)
-        
+
         if code_match:
             code = code_match.group(1)
             logger.info(f"🎯 CODE DETECTED: {code}")
-            
-            # Send to WhatsApp bot (Node.js) with retry
-            send_to_whatsapp_with_retry({"code": code, "message": content})
+
+            # 🔑 FIX: Increased timeout to 20s to allow Node.js
+            # to wait for Baileys session to be ready before responding
+            try:
+                wa_resp = requests.post(
+                    WA_BOT_URL,
+                    json={"code": code, "message": content},
+                    timeout=20  # was 8 — Node.js may need ~15s to sync
+                )
+                logger.info(f"🚀 WhatsApp bot response: {wa_resp.status_code} — {wa_resp.text}")
+            except Exception as wa_err:
+                logger.error(f"❌ WhatsApp bot unreachable: {wa_err}")
         else:
-            logger.warning(f"🤔 No 6-digit code found")
-        
+            logger.warning("🤔 No 6-digit code found")
 
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Send to Telegram
+
         message = (
             f"📩 <b>New SMS</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
@@ -134,14 +152,17 @@ def receive_sms():
             f"━━━━━━━━━━━━━━━━\n"
             f"💬 <code>{content}</code>"
         )
-        
+
         send_telegram(message)
         return jsonify({"status": "success"}), 200
-            
+
     except Exception as e:
         logger.error(f"❌ ERROR: {e}")
         return jsonify({"status": "error"}), 500
 
+# ══════════════════════════════════════════
+#  OTHER ROUTES
+# ══════════════════════════════════════════
 @app.route('/', methods=['GET'])
 def status():
     return "<h1>🟢 SMS to WhatsApp Bridge Running</h1>"
@@ -149,7 +170,6 @@ def status():
 @app.route('/qr', methods=['GET'])
 def get_qr():
     try:
-        # Port 5001 is where the Node.js bot serves its /qr
         qr_resp = requests.get("http://127.0.0.1:5001/qr", timeout=5)
         return qr_resp.content, qr_resp.status_code
     except Exception as e:
@@ -158,7 +178,13 @@ def get_qr():
 @app.route('/test', methods=['GET'])
 def test():
     send_telegram("🧪 Test - Bridge is working!")
-    send_to_whatsapp_with_retry({"code": "123456", "message": "Test"})
+
+    try:
+        wa_test = requests.post(WA_BOT_URL, json={"code": "123456", "message": "Test"}, timeout=20)
+        logger.info(f"WhatsApp test: {wa_test.status_code} — {wa_test.text}")
+    except Exception as e:
+        logger.warning(f"⚠️ WhatsApp test failed: {e}")
+
     return "OK - Check Telegram & WhatsApp", 200
 
 if __name__ == '__main__':
