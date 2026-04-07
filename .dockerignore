@@ -1,7 +1,0 @@
-node_modules/
-__pycache__/
-*.pyc
-.env
-.git
-auth_info_baileys/
-*.log
